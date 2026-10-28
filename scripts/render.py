@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -29,7 +30,7 @@ from check_cutlist import (  # noqa: E402  (same-folder helper)
 )
 
 CUT_OVERLAP = 0.05          # a "hard cut" inside the xfade path: 1.5 frames at 30fps
-TRANSITION_MAP = {"fade": "fade", "white": "white", "wipe": "wipeleft", "cut": "fade", "unknown": "fade"}
+TRANSITION_MAP = {"fade": "fade", "white": "fadewhite", "wipe": "wipeleft", "cut": "fade", "unknown": "fade"}
 DEGRADE = {"shake": "plain", "unknown": "plain"}
 
 
@@ -40,6 +41,19 @@ def ffmpeg_bin() -> str:
     if not found:
         raise SystemExit("ffmpeg not found on PATH")
     return found
+
+
+def ffmpeg_caps() -> dict:
+    """Ask ffmpeg what it can do; a missing filter must degrade, never explode."""
+    caps = {"xfade": False, "fadewhite": False}
+    text = ""
+    for args in (["-hide_banner", "-filters"], ["-hide_banner", "-h", "filter=xfade"]):
+        proc = subprocess.run([ffmpeg_bin(), *args], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace")
+        text += (proc.stdout or "") + (proc.stderr or "")
+    caps["xfade"] = "xfade" in text
+    caps["fadewhite"] = "fadewhite" in text
+    return caps
 
 
 def run(cmd: list[str], log: Path | None, dry: bool, cwd: Path | None = None) -> None:
@@ -155,57 +169,111 @@ def audio_filters(row: dict, project: dict, has_audio: bool) -> str:
 
 # ---------------------------------------------------------------- main flow
 
+def resolve_sfx(project: dict, kind: str) -> Path | None:
+    """Find <sfx_dir>/<kind>.wav; synthesise it on the spot if it is missing."""
+    folder = Path(project.get("sfx_dir") or "assets/sfx")
+    if not folder.is_absolute():
+        media = Path(project.get("media_dir") or ".").resolve()
+        candidate = media / folder
+        folder = candidate if candidate.exists() else folder.resolve()
+    target = folder / f"{kind}.wav"
+    if target.exists():
+        return target
+    try:
+        import gen_sfx                                    # same folder, stdlib only
+        gen_sfx.generate([kind], folder)
+    except Exception as exc:                              # pragma: no cover
+        print(f"warn: cannot synthesise sfx {kind}: {exc}", file=sys.stderr)
+        return None
+    return target if target.exists() else None
+
+
 def render_shot(row: dict, project: dict, workdir: Path, probe_index: dict, preset: str, crf: int, dry: bool) -> dict:
     src = Path(row["source"])
     if not src.is_absolute():
         src = Path(project.get("media_dir") or ".") / src
     src = src.resolve()
-    info = probe_index.get(str(src), {})
+    info = probe_index.get(str(src))
+    if info is None:                                    # no probe.json: measure once, then cache
+        info = probe_media(src) or {}
+        probe_index[str(src)] = info
     start, end = row["start_sec"], row["end_sec"]
     visual = shot_visual_duration(row)
+    src_w = int(info.get("width") or 0)
+    upscale = round(project["width"] / src_w, 2) if src_w else 0.0
     caption = (row.get("caption") or "").strip()
     style = row["caption_style"]
     project_local = dict(project, _style=style)
     shot_dir = workdir / f"shot{int(row['index']):02d}"
     shot_dir.mkdir(parents=True, exist_ok=True)
-    out = shot_dir / "clip.mp4"
+    target = shot_dir / "clip.mp4"
+    out = shot_dir / "clip.part.mp4"           # a half-written file never gets the real name
 
     if caption and style != "none":
         write_ass(shot_dir / "cap.ass", caption, visual, project_local)
 
     has_audio = bool(info.get("has_audio", True)) and (row["audio_mode"] or project.get("audio")) != "mute"
-    cmd = [ffmpeg_bin(), "-y", "-v", "error", "-ss", f"{start}", "-t", f"{end - start}", "-i", str(src)]
-    if not has_audio:
-        cmd += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
-    cmd += ["-vf", video_filters(row, project, visual, bool(caption and style != "none")), "-map", "0:v:0"]
-    if has_audio:
-        af = audio_filters(row, project, True)
-        cmd += ["-map", "0:a:0"] + (["-af", af] if af else [])
-    else:
-        cmd += ["-map", "1:a:0"]
-    cmd += ["-t", f"{max(0.1, visual):.3f}",
+    vf = video_filters(row, project, visual, bool(caption and style != "none"))
+    af = audio_filters(row, project, True) if has_audio else ""
+
+    sfx_file = None
+    sfx_volume = 0.0
+    kind = (row.get("sfx_kind") or "").strip()
+    if kind and kind != "unknown":
+        sfx_file = resolve_sfx(project, kind)
+        sfx_volume = float(row.get("sfx_volume") or project.get("sfx_volume") or 0.8)
+
+    head = [ffmpeg_bin(), "-y", "-v", "error", "-ss", f"{start}", "-t", f"{end - start}", "-i", str(src)]
+    tail = ["-t", f"{max(0.1, visual):.3f}",
             "-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p",
             "-r", str(project["fps"]), "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
             "-movflags", "+faststart", str(out)]
+
+    if sfx_file is None:                                   # plain path: one video stream, one audio stream
+        cmd = list(head)
+        if not has_audio:
+            cmd += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
+        cmd += ["-vf", vf, "-map", "0:v:0"]
+        if has_audio:
+            cmd += ["-map", "0:a:0"] + (["-af", af] if af else [])
+        else:
+            cmd += ["-map", "1:a:0"]
+        cmd += tail
+    else:                                                  # sfx path: mix the effect under the shot audio
+        cmd = list(head)
+        index = 1
+        graph: list[str] = [f"[0:v]{vf}[v]"]
+        if has_audio:
+            graph.append(f"[0:a]{af + ',' if af else ''}aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[ba]")
+        else:
+            cmd += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
+            graph.append(f"[{index}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[ba]")
+            index += 1
+        cmd += ["-i", str(sfx_file)]
+        graph.append(f"[{index}:a]volume={sfx_volume},aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[bs]")
+        graph.append("[ba][bs]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]")
+        cmd += ["-filter_complex", ";".join(graph), "-map", "[v]", "-map", "[aout]", *tail]
+
     try:
         run(cmd, shot_dir / "ffmpeg.log", dry, cwd=shot_dir)
     except RuntimeError:
-        if not has_audio:
+        if not has_audio or sfx_file is None:
             raise
-        # probe lied (or no probe was supplied): rebuild the shot with silent audio
+        # probe lied (or no probe was supplied): rebuild the shot with silent audio, no sfx
         silent = [ffmpeg_bin(), "-y", "-v", "error", "-ss", f"{start}", "-t", f"{end - start}",
                   "-i", str(src), "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
-                  "-vf", video_filters(row, project, visual, bool(caption and style != "none")),
-                  "-map", "0:v:0", "-map", "1:a:0", "-t", f"{max(0.1, visual):.3f}",
-                  "-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p",
-                  "-r", str(project["fps"]), "-c:a", "aac", "-b:a", "128k",
-                  "-movflags", "+faststart", str(out)]
+                  "-vf", vf, "-map", "0:v:0", "-map", "1:a:0", *tail]
         run(silent, shot_dir / "ffmpeg.log", dry, cwd=shot_dir)
-    actual = probe_media(out).get("duration", 0.0) if (not dry and out.exists()) else visual
+    if not dry and out.exists():
+        os.replace(out, target)                # publish only after ffmpeg exited clean
+    actual = probe_media(target).get("duration", 0.0) if (not dry and target.exists()) else visual
     return {"index": row["index"], "source": src.name, "start": start, "end": end,
             "speed": row["speed"], "planned": visual, "actual": round(actual, 3),
             "framing": row["framing_kind"], "transition": row["transition_kind"],
-            "degraded": [k for k in (row["framing_kind"], row["transition_kind"]) if k in {"shake", "unknown"}],
+            "sfx": kind, "sfx_volume": sfx_volume if sfx_file else 0.0,
+            "degraded": ([k for k in (row["framing_kind"], row["transition_kind"], kind) if k in {"shake", "unknown"}]
+                         + (["upscale"] if upscale > 1.05 else [])),
+            "upscale": upscale,
             "caption": caption}
 
 
@@ -285,6 +353,16 @@ def main(argv: list[str] | None = None) -> int:
     for item in warnings:
         print(f"warn: {item}", file=sys.stderr)
 
+    caps = ffmpeg_caps()
+    if not caps["xfade"]:
+        warnings.append("此 ffmpeg 没有 xfade 滤镜：转场全部降级为硬切")
+    elif not caps["fadewhite"]:
+        downgraded = [r for r in rows if r["transition_kind"] == "white"]
+        for row in downgraded:
+            row["transition_kind"] = "fade"
+        if downgraded:
+            warnings.append("此 ffmpeg 没有 fadewhite：闪白降级为叠化")
+
     out_dir = Path(args.out).resolve()          # absolute from here on: shot renders switch cwd
     workdir = out_dir / "_work"
     workdir.mkdir(parents=True, exist_ok=True)
@@ -293,7 +371,7 @@ def main(argv: list[str] | None = None) -> int:
 
     shots = [render_shot(row, project, workdir, probe_index, preset, crf, args.dry_run) for row in rows]
     clips = [workdir / f"shot{int(r['index']):02d}" / "clip.mp4" for r in rows]
-    transitions = [r for r in rows[:-1] if r["transition_kind"] not in {"cut"}]
+    transitions = [r for r in rows[:-1] if r["transition_kind"] not in {"cut"}] if caps["xfade"] else []
 
     if transitions:
         total = concat_xfade_clips(shots, rows, clips, workdir / "joined.mp4", workdir, project, preset, crf, args.dry_run)
@@ -324,6 +402,8 @@ def main(argv: list[str] | None = None) -> int:
         "degraded": [s["index"] for s in shots if s["degraded"]],
         "path": "xfade" if transitions else "concat-copy",
         "bgm": bool(bgm and not args.no_bgm),
+        "ffmpeg_caps": caps,
+        "upscaled": [s["index"] for s in shots if s.get("upscale", 0) > 1.05],
     }
     if not args.dry_run:
         if final.exists():

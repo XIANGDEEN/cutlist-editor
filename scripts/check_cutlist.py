@@ -36,6 +36,7 @@ COLUMNS = {
     "字幕": "caption", "caption": "caption",
     "字幕样式": "caption_style", "caption_style": "caption_style",
     "声音": "audio", "audio": "audio",
+    "音效": "sfx", "sfx": "sfx", "SFX": "sfx",
     "备注": "note", "note": "note",
 }
 
@@ -48,6 +49,12 @@ CAPTION_STYLE = {"预设": "preset", "preset": "preset", "强调": "strong", "st
                  "小字": "small", "small": "small", "无": "none", "none": "none"}
 AUDIO_MODE = {"原声": "keep", "keep": "keep", "静音": "mute", "mute": "mute",
               "压低": "lower", "lower": "lower"}
+SFX = {"无": "", "none": "", "": "",
+       "whoosh": "whoosh", "呼呼": "whoosh", "转场音": "whoosh",
+       "boom": "boom", "重击": "boom", "落点": "boom",
+       "click": "click", "咔": "click",
+       "pop": "pop", "弹出": "pop",
+       "riser": "riser", "上升": "riser"}
 
 
 class CutListError(ValueError):
@@ -56,11 +63,16 @@ class CutListError(ValueError):
 
 # ---------------------------------------------------------------- primitives
 
-_TIME_RE = re.compile(r"^\s*(?:(\d+):)?(?:(\d{1,2}):)?(\d{1,2}(?:\.\d+)?)\s*$")
+_SCALES = (3600, 60, 1)
 
 
 def parse_time(value: str | float | int | None) -> float:
-    """Accept 750.5, 12:30.5, 01:02:03.400. Integers are seconds."""
+    """Accept 750.5, 12:30.5, 01:02:03.400. Integers are seconds.
+
+    Segments are interpreted right-to-left (seconds, minutes, hours), so
+    "12:30.5" is 12m30.5s -- never 12h.  (An optional-groups regex cannot tell
+    those apart: it greedily reads the first number as hours.)
+    """
     if value is None:
         raise CutListError("empty time")
     if isinstance(value, (int, float)):
@@ -72,15 +84,16 @@ def parse_time(value: str | float | int | None) -> float:
         return round(float(text), 3)
     except ValueError:
         pass
-    match = _TIME_RE.match(text)
-    if not match:
+    parts = text.split(":")
+    if not 1 <= len(parts) <= 3:
         raise CutListError(f"cannot parse time: {text!r} (use mm:ss.s, hh:mm:ss.mmm or seconds)")
-    hours, minutes, seconds = match.groups()
-    total = float(seconds)
-    if minutes is not None:
-        total += int(minutes) * 60
-    if hours is not None:
-        total += int(hours) * 3600
+    try:
+        numbers = [float(part) for part in parts]
+    except ValueError:
+        raise CutListError(f"cannot parse time: {text!r} (use mm:ss.s, hh:mm:ss.mmm or seconds)") from None
+    total = 0.0
+    for number, scale in zip(numbers, _SCALES[len(_SCALES) - len(numbers):]):
+        total += number * scale
     return round(total, 3)
 
 
@@ -122,6 +135,29 @@ def parse_framing(text: str) -> tuple[str, str]:
     return kind, arg.strip()
 
 
+def parse_sfx(text: str) -> tuple[str, float]:
+    """'whoosh' / '重击:0.6' / '无' -> (kind, volume). Empty kind means silent."""
+    raw = (text or "").strip()
+    if not raw:
+        return "", 0.0
+    head, _, arg = raw.partition(":")
+    if not arg:
+        head, _, arg = raw.partition("：")
+    key = head.strip().lower()
+    if key not in SFX:
+        return "unknown", 0.0
+    kind = SFX[key]
+    if not kind:
+        return "", 0.0
+    volume = 0.8
+    if arg.strip():
+        try:
+            volume = float(arg.strip())
+        except ValueError:
+            volume = 0.8
+    return kind, round(min(max(volume, 0.0), 2.0), 2)
+
+
 # ---------------------------------------------------------------- loading
 
 def _normalise_keys(row: dict) -> dict:
@@ -139,6 +175,7 @@ def load_project(path: str | Path | None) -> dict:
     """Global settings from a two-column CSV (字段,值) or a TOML file."""
     defaults = {"title": "", "width": 1080, "height": 1920, "fps": 30, "target_duration": 0.0,
                 "media_dir": "", "bgm": "", "bgm_volume": 0.6, "audio": "keep",
+                "sfx_dir": "assets/sfx", "sfx_volume": 0.8,
                 "intro": 0.0, "outro": 0.0, "font": "微软雅黑", "out_dir": "out"}
     if not path:
         return defaults
@@ -164,6 +201,7 @@ def load_project(path: str | Path | None) -> dict:
                "帧率": "fps", "fps": "fps", "目标时长": "target_duration",
                "素材文件夹": "media_dir", "media_dir": "media_dir", "bgm": "bgm", "BGM 文件": "bgm",
                "bgm_volume": "bgm_volume", "BGM 音量": "bgm_volume", "原声处理": "audio", "audio": "audio",
+               "音效目录": "sfx_dir", "sfx_dir": "sfx_dir", "音效音量": "sfx_volume", "sfx_volume": "sfx_volume",
                "片头": "intro", "intro": "intro", "片尾": "outro", "outro": "outro",
                "字幕字体": "font", "font": "font", "输出目录": "out_dir", "out_dir": "out_dir"}
     merged = dict(defaults)
@@ -179,12 +217,30 @@ def load_project(path: str | Path | None) -> dict:
                 w, _, h = value.lower().partition("x")
                 merged["width"], merged["height"] = int(w), int(h)
             continue
-        if mapped in {"fps", "target_duration", "intro", "outro"}:
+        if mapped in {"intro", "outro"}:
+            text = value.replace(" ", "")
+            if text in {"无", "none", "-", ""}:
+                merged[mapped] = 0.0
+                continue
+            if text.startswith("有"):
+                _, _, tail = text.partition(",")
+                text = tail or "0.8"
             try:
-                value = float(value.rstrip("s秒")) if mapped != "fps" else int(float(value))
+                merged[mapped] = float(text.rstrip("s秒"))
+            except ValueError:
+                raise CutListError(f"片头/片尾要写「无」或「有,0.8」，读到 {value!r}") from None
+            continue
+        if mapped == "target_duration" and value in {"不限", "none", "-"}:
+            merged[mapped] = 0.0
+            continue
+        if mapped in {"fps", "target_duration"}:
+            try:
+                value = int(float(value)) if mapped == "fps" else float(value.rstrip("s秒"))
             except ValueError:
                 raise CutListError(f"bad number for {key}: {value!r}") from None
         if mapped == "bgm_volume":
+            value = float(value)
+        if mapped == "sfx_volume":
             value = float(value)
         merged[mapped] = value
     return merged
@@ -215,6 +271,7 @@ def load_cutlist(path: str | Path) -> list[dict]:
             row["speed"] = float(row.get("speed") or 1.0)
             row["transition_kind"], row["transition_sec"] = parse_transition(row.get("transition", ""))
             row["framing_kind"], row["framing_arg"] = parse_framing(row.get("framing", ""))
+            row["sfx_kind"], row["sfx_volume"] = parse_sfx(row.get("sfx", ""))
             row["caption_style"] = CAPTION_STYLE.get((row.get("caption_style") or "").strip(), "preset")
             row["audio_mode"] = AUDIO_MODE.get((row.get("audio") or "").strip(), "")
             rows.append(row)
@@ -254,6 +311,8 @@ def validate(rows: list[dict], project: dict, probe_index: dict[str, dict] | Non
             warnings.append(f"{tag} 转场值无法识别，将降级为硬切")
         if row["framing_kind"] == "unknown":
             warnings.append(f"{tag} 画面值无法识别，将降级为原样")
+        if row.get("sfx_kind") == "unknown":
+            warnings.append(f"{tag} 音效值无法识别，将不配音效")
         if shot_visual_duration(row) < 0.3:
             warnings.append(f"{tag} 单镜仅 {shot_visual_duration(row):.2f}s，可能误填")
         src = Path(row["source"])
@@ -267,6 +326,9 @@ def validate(rows: list[dict], project: dict, probe_index: dict[str, dict] | Non
             if row["end_sec"] > info["duration"] + 0.05:
                 errors.append(f"{tag} 出点 {row['end_sec']}s 超过素材时长 {info['duration']}s")
     target = float(project.get("target_duration") or 0)
+    last = rows[-1]
+    if last["transition_kind"] not in {"cut", "unknown"}:
+        warnings.append(f"#{last['index']} 是最后一镜，转场没有下一镜可切，已忽略")
     if target > 0:
         total = timeline_duration(rows)
         if abs(total - target) / target > 0.2:
